@@ -1,0 +1,264 @@
+#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+
+const LOG_DIR = process.env.RAW_TRACE_DIR || path.join(process.env.HOME || process.cwd(), ".local/share/opencode-trace/logs");
+
+function usage() {
+  console.log(`Usage:
+  opencode-trace [latest|turn|dataset|list|file <path>] [field]
+
+Fields:
+  all        Full proxy record JSON (default)
+  request    Full raw request JSON
+  messages   Full raw request messages
+  system     Full system messages
+  response   Full raw response JSON
+  reasoning  Full aggregated reasoning_content
+  content    Full aggregated assistant content
+  output     Assistant output object: reasoning_content + content + tool_calls
+  transcript Request messages plus this call's assistant output
+  tools      Tool schemas sent with this request
+  sample     Training sample for this model call
+  files      Matching raw trace file paths
+
+Examples:
+  opencode-trace list
+  opencode-trace latest tools
+  opencode-trace latest sample
+  opencode-trace turn transcript
+  opencode-trace dataset`);
+}
+
+function printJson(value) {
+  process.stdout.write(JSON.stringify(value, null, 2) + "\n");
+}
+
+function load(file) {
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+function allFiles() {
+  if (!fs.existsSync(LOG_DIR)) return [];
+  return fs
+    .readdirSync(LOG_DIR)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => path.join(LOG_DIR, name))
+    .sort((a, b) => {
+      const aStarted = load(a).started_at || "";
+      const bStarted = load(b).started_at || "";
+      return bStarted.localeCompare(aStarted);
+    });
+}
+
+function latestFile() {
+  return allFiles()[0];
+}
+
+function lastUserPrompt(data) {
+  const messages = (data.raw_request && data.raw_request.messages) || [];
+  const users = messages.filter((message) => {
+    return message.role === "user" &&
+      typeof message.content === "string" &&
+      !message.content.startsWith("Generate a title for this conversation:");
+  });
+  return users.length ? users[users.length - 1].content : "";
+}
+
+function reconstructAssistantOutput(data) {
+  const toolCalls = new Map();
+  for (const event of data.raw_stream_events || []) {
+    for (const choice of event.choices || []) {
+      const delta = choice.delta || {};
+      for (const call of delta.tool_calls || []) {
+        const index = call.index || 0;
+        const existing = toolCalls.get(index) || {
+          id: "",
+          type: "function",
+          function: { name: "", arguments: "" },
+        };
+        if (call.id) existing.id += call.id;
+        if (call.type) existing.type = call.type;
+        if (call.function) {
+          if (call.function.name) existing.function.name += call.function.name;
+          if (call.function.arguments) existing.function.arguments += call.function.arguments;
+        }
+        toolCalls.set(index, existing);
+      }
+    }
+  }
+
+  const output = {
+    role: "assistant",
+    reasoning_content: data.reasoning_content || "",
+    content: data.content || "",
+    finish_reason: data.finish_reason || null,
+    usage: data.usage || null,
+  };
+
+  const calls = [...toolCalls.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map((entry) => entry[1]);
+  if (calls.length) output.tool_calls = calls;
+  if (!calls.length && Array.isArray(data.tool_calls) && data.tool_calls.length) output.tool_calls = data.tool_calls;
+
+  if (!output.tool_calls && data.raw_response && Array.isArray(data.raw_response.choices)) {
+    const message = data.raw_response.choices[0] && data.raw_response.choices[0].message;
+    if (message && Array.isArray(message.tool_calls)) output.tool_calls = message.tool_calls;
+  }
+
+  return output;
+}
+
+function trainingSample(data) {
+  const request = data.raw_request || {};
+  const params = {};
+  for (const [key, value] of Object.entries(request)) {
+    if (!["messages", "tools", "tool_choice"].includes(key)) params[key] = value;
+  }
+  return {
+    model: request.model || null,
+    params,
+    messages: request.messages || [],
+    tools: request.tools || [],
+    tool_choice: request.tool_choice ?? null,
+    assistant_output: reconstructAssistantOutput(data),
+    raw_trace_file: data.raw_trace_file || null,
+    started_at: data.started_at || null,
+    completed_at: data.completed_at || null,
+  };
+}
+
+function printField(data, field) {
+  const request = data.raw_request || {};
+  const messages = request.messages || [];
+  const output = reconstructAssistantOutput(data);
+
+  switch (field) {
+    case "all":
+      printJson(data);
+      break;
+    case "request":
+      printJson(request);
+      break;
+    case "messages":
+      printJson(messages);
+      break;
+    case "system":
+      for (const message of messages.filter((m) => m.role === "system")) {
+        process.stdout.write((message.content || "") + "\n");
+      }
+      break;
+    case "response":
+      printJson(data.raw_response);
+      break;
+    case "reasoning":
+      process.stdout.write((data.reasoning_content || "") + "\n");
+      break;
+    case "content":
+      process.stdout.write((data.content || "") + "\n");
+      break;
+    case "output":
+      printJson(output);
+      break;
+    case "transcript":
+      printJson(messages.concat([output]));
+      break;
+    case "tools":
+      printJson(request.tools || []);
+      break;
+    case "sample":
+      printJson(trainingSample(data));
+      break;
+    case "files":
+      process.stdout.write((data.raw_trace_file || "") + "\n");
+      break;
+    default:
+      console.error(`Unknown field: ${field}`);
+      usage();
+      process.exit(1);
+  }
+}
+
+const args = process.argv.slice(2);
+const command = args[0] || "latest";
+const field = args[1] || "all";
+
+if (["-h", "--help", "help"].includes(command)) {
+  usage();
+  process.exit(0);
+}
+
+if (command === "list") {
+  for (const file of allFiles().slice(0, 50)) {
+    const data = load(file);
+    const model = data.raw_request && data.raw_request.model;
+    const user = ((data.raw_request && data.raw_request.messages) || []).findLast?.((m) => m.role === "user");
+    console.log(`${data.started_at}  ${model || "-"}  ${file}`);
+    if (user && typeof user.content === "string") {
+      console.log(`  ${user.content.replace(/\s+/g, " ").slice(0, 120)}`);
+    }
+  }
+  process.exit(0);
+}
+
+if (command === "turn" || command === "dataset") {
+  const latest = latestFile();
+  if (!latest) {
+    console.error(`No trace files found in ${LOG_DIR}`);
+    process.exit(1);
+  }
+  const selectedField = command === "dataset" ? "sample" : (args[1] || "messages");
+  const latestData = load(latest);
+  const prompt = lastUserPrompt(latestData);
+  const matches = allFiles()
+    .map((file) => ({ file, data: load(file) }))
+    .filter(({ data }) => lastUserPrompt(data) === prompt)
+    .sort((a, b) => (a.data.started_at || "").localeCompare(b.data.started_at || ""));
+
+  if (selectedField === "files") {
+    for (const match of matches) process.stdout.write(match.file + "\n");
+  } else if (["messages", "request", "response", "all", "output", "transcript", "tools", "sample"].includes(selectedField)) {
+    printJson(matches.map(({ file, data }) => ({
+      file,
+      started_at: data.started_at,
+      completed_at: data.completed_at,
+      value: selectedField === "messages" ? ((data.raw_request && data.raw_request.messages) || []) :
+        selectedField === "request" ? data.raw_request :
+        selectedField === "response" ? data.raw_response :
+        selectedField === "output" ? reconstructAssistantOutput(data) :
+        selectedField === "transcript" ? (((data.raw_request && data.raw_request.messages) || []).concat([reconstructAssistantOutput(data)])) :
+        selectedField === "tools" ? ((data.raw_request && data.raw_request.tools) || []) :
+        selectedField === "sample" ? trainingSample(data) :
+        data,
+    })));
+  } else if (["reasoning", "content", "system"].includes(selectedField)) {
+    for (const match of matches) {
+      console.log(`\n--- ${match.data.started_at} ${match.file} ---`);
+      printField(match.data, selectedField);
+    }
+  } else {
+    console.error(`Unknown turn field: ${selectedField}`);
+    usage();
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+let file;
+let selectedField = field;
+if (command === "file") {
+  file = args[1];
+  selectedField = args[2] || "all";
+} else if (command === "latest") {
+  file = latestFile();
+} else {
+  file = command;
+}
+
+if (!file || !fs.existsSync(file)) {
+  console.error(`Trace file not found: ${file || "(none)"}`);
+  process.exit(1);
+}
+
+printField(load(file), selectedField);

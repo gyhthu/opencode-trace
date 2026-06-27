@@ -1,0 +1,23 @@
+{
+  "name": "opencode-trace",
+  "version": "0.1.0",
+  "description": "Local OpenAI-compatible proxy for capturing full OpenCode agent traces for training data.",
+  "type": "commonjs",
+  "main": "src/server.js",
+  "bin": {
+    "opencode-trace": "bin/opencode-trace"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "health": "node -e \"fetch('http://127.0.0.1:5010/health').then(r=>r.text()).then(console.log)\""
+  },
+  "keywords": [
+    "opencode",
+    "agent",
+    "trace",
+    "tool-calling",
+    "training-data",
+    "openai-compatible"
+  ],
+  "license": "MIT"
+}
