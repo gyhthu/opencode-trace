@@ -6,7 +6,7 @@ const LOG_DIR = process.env.RAW_TRACE_DIR || path.join(process.env.HOME || proce
 
 function usage() {
   console.log(`Usage:
-  opencode-trace [latest|turn|dataset|list|file <path>] [field]
+  opencode-trace [latest|turn|dataset|recent|list|file <path>] [field]
 
 Fields:
   all        Full proxy record JSON (default)
@@ -198,6 +198,43 @@ if (command === "list") {
     if (user && typeof user.content === "string") {
       console.log(`  ${user.content.replace(/\s+/g, " ").slice(0, 120)}`);
     }
+  }
+  process.exit(0);
+}
+
+if (command === "recent") {
+  const count = Number(args[1] || 20);
+  const selectedField = args[2] || "sample";
+  const matches = allFiles()
+    .slice(0, Number.isFinite(count) && count > 0 ? count : 20)
+    .map((file) => ({ file, data: load(file) }))
+    .sort((a, b) => (a.data.started_at || "").localeCompare(b.data.started_at || ""));
+
+  if (selectedField === "files") {
+    for (const match of matches) process.stdout.write(match.file + "\n");
+  } else if (["messages", "request", "response", "all", "output", "transcript", "tools", "sample"].includes(selectedField)) {
+    printJson(matches.map(({ file, data }) => ({
+      file,
+      started_at: data.started_at,
+      completed_at: data.completed_at,
+      value: selectedField === "messages" ? ((data.raw_request && data.raw_request.messages) || []) :
+        selectedField === "request" ? data.raw_request :
+        selectedField === "response" ? data.raw_response :
+        selectedField === "output" ? reconstructAssistantOutput(data) :
+        selectedField === "transcript" ? (((data.raw_request && data.raw_request.messages) || []).concat([reconstructAssistantOutput(data)])) :
+        selectedField === "tools" ? ((data.raw_request && data.raw_request.tools) || []) :
+        selectedField === "sample" ? trainingSample(data) :
+        data,
+    })));
+  } else if (["reasoning", "content", "system"].includes(selectedField)) {
+    for (const match of matches) {
+      console.log(`\n--- ${match.data.started_at} ${match.file} ---`);
+      printField(match.data, selectedField);
+    }
+  } else {
+    console.error(`Unknown recent field: ${selectedField}`);
+    usage();
+    process.exit(1);
   }
   process.exit(0);
 }

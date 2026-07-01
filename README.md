@@ -254,6 +254,7 @@ opencode-trace latest transcript # request messages + assistant output
 opencode-trace latest sample     # one training sample
 opencode-trace turn sample       # all samples for the latest user turn
 opencode-trace dataset           # alias for turn sample
+opencode-trace recent 20 sample  # recent calls by time, useful for parent + subagent traces
 ```
 
 ## Log Files
